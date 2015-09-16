@@ -76,6 +76,8 @@ module Rack
     def call(env)
       info      = (env[ENV_INFO_KEY] ||= RequestDetails.new)
       info.id ||= env["HTTP_X_REQUEST_ID"] || SecureRandom.hex
+      @info = info
+      @env_id = env.object_id
 
       time_started_service = Time.now                      # The wall time the request started being processed by rack
       ts_started_service   = fsecs                         # The monotonic time the request started being processed by rack
@@ -91,7 +93,7 @@ module Rack
         seconds_service_left    = final_wait_timeout - seconds_waited      # first calculation of service timeout (relevant if request doesn't get expired, may be overriden later)
         info.wait, info.timeout = seconds_waited, final_wait_timeout       # updating the info properties; info.timeout will be the wait timeout at this point
         if seconds_service_left <= 0 # expire requests that have waited for too long in the queue (as they are assumed to have been dropped by the web server / routing layer at this point)
-          RT._set_state! env, :expired
+          _set_state! env, :expired
           raise RequestExpiryError.new(env), "Request older than #{info.ms(:timeout)}."
         end
       end
@@ -103,13 +105,13 @@ module Rack
       info.timeout = service_timeout # nice and simple, when service_past_wait is true, not so much otherwise:
       info.timeout = seconds_service_left if !service_past_wait && seconds_service_left && seconds_service_left > 0 && seconds_service_left < service_timeout
 
-      RT._set_state! env, :ready                            # we're good to go, but have done nothing yet
+      _set_state! env, :ready                            # we're good to go, but have done nothing yet
 
       heartbeat_event = nil                                 # init var so it's in scope for following proc
       register_state_change = ->(status = :active) {        # updates service time and state; will run every second
         heartbeat_event.cancel! if status != :active        # if the request is no longer active we should stop updating every second
         info.service = fsecs - ts_started_service           # update service time
-        RT._set_state! env, status                          # update status
+        _set_state! env, status                          # update status
       }
       heartbeat_event = RT::Scheduler.run_every(1) { register_state_change.call :active }  # start updating every second while active; if log level is debug, this will log every sec
 
@@ -161,10 +163,15 @@ module Rack
       true
     end
 
-    def self._set_state!(env, state)
+    def _set_state!(env, state)
       raise "Invalid state: #{state.inspect}" unless VALID_STATES.include? state
-      env[ENV_INFO_KEY].state = state
-      notify_state_change_observers(env)
+      info = env[ENV_INFO_KEY]
+      env_keys = env.keys.reject { |k| k =~ /^(rack|action_dispatch|action_controller|puma)\.|^[A-Z_]+$/ }.sort.inspect
+      warn "[RTDEBUG] info:#{info.class.name} env_id:#{env.object_id}/#{@env_id}; keys:#{env_keys} orig_info:#{@info} ##{@info.id} @#{Time.now.utc}"
+      return unless info.is_a?(RequestDetails)
+
+      info.state = state
+      RT.notify_state_change_observers(env)
     end
 
     ### state change notification-related methods
