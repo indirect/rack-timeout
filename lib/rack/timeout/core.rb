@@ -107,11 +107,14 @@ module Rack
 
       _set_state! env, :ready                            # we're good to go, but have done nothing yet
 
+      mx_state_change = Mutex.new
       heartbeat_event = nil                                 # init var so it's in scope for following proc
       register_state_change = ->(status = :active) {        # updates service time and state; will run every second
-        heartbeat_event.cancel! if status != :active        # if the request is no longer active we should stop updating every second
-        info.service = fsecs - ts_started_service           # update service time
-        _set_state! env, status                          # update status
+        mx_state_change.synchronize {
+          heartbeat_event.cancel! if status != :active      # if the request is no longer active we should stop updating every second
+          info.service = fsecs - ts_started_service         # update service time
+          _set_state! env, status                           # update status
+        }
       }
       heartbeat_event = RT::Scheduler.run_every(1) { register_state_change.call :active }  # start updating every second while active; if log level is debug, this will log every sec
 
@@ -167,7 +170,9 @@ module Rack
       raise "Invalid state: #{state.inspect}" unless VALID_STATES.include? state
       info = env[ENV_INFO_KEY]
       env_keys = env.keys.reject { |k| k =~ /^(rack|action_dispatch|action_controller|puma)\.|^[A-Z_]+$/ }.sort.inspect
-      warn "[RTDEBUG] info:#{info.class.name} env_id:#{env.object_id}/#{@env_id}; keys:#{env_keys} orig_info:#{@info} ##{@info.id} @#{Time.now.utc}"
+      # warn caller
+      at = caller.grep(/\/core.rb:/).map { |s| s[/:(\d+):in `/, 1] }.join(",")
+      warn "source=rack-timeout-debug info-present=#{!info.nil?} env-same=#{env.object_id==@env_id} env-keys-count=#{env.keys.length} orig-info-req-id=#{@info.id} thread=#{Thread.current.object_id} time=#{Time.now.utc.strftime('%T.%L')} at=#{at}\n"
       return unless info.is_a?(RequestDetails)
 
       info.state = state
