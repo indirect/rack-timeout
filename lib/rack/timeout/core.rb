@@ -12,7 +12,7 @@ module Rack
 
     def self.extended obj
       obj.instance_variable_set(:@__callstack_logs, [])
-      (obj.class.instance_methods(false) - instance_methods - [:inspect]).each do |m|
+      (obj.class.instance_methods(false) - instance_methods - [:inspect, :caller]).reject { |m| m.to_s =~ /^__/ }.each do |m|
         obj.singleton_class.instance_exec(m) { |m| alias_method "__#{m}_without_logging", m }
         obj.define_singleton_method(m) do |*a, &b|
           __log_method_call m, *a, &b
