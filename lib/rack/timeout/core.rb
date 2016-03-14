@@ -128,14 +128,11 @@ module Rack
 
       _set_state! env, :ready                            # we're good to go, but have done nothing yet
 
-      mx_state_change = Mutex.new
       heartbeat_event = nil                                 # init var so it's in scope for following proc
       register_state_change = ->(status = :active) {        # updates service time and state; will run every second
-        mx_state_change.synchronize {
-          heartbeat_event.cancel! if status != :active      # if the request is no longer active we should stop updating every second
-          info.service = fsecs - ts_started_service         # update service time
-          _set_state! env, status                           # update status
-        }
+        heartbeat_event.cancel! if status != :active        # if the request is no longer active we should stop updating every second
+        info.service = fsecs - ts_started_service           # update service time
+        _set_state! env, status                             # update status
       }
       heartbeat_event = RT::Scheduler.run_every(1) { register_state_change.call :active }  # start updating every second while active; if log level is debug, this will log every sec
 
