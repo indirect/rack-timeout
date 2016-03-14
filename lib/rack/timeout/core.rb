@@ -6,27 +6,28 @@ require_relative "support/timeout"
 require_relative "legacy"
 
 module Rack
-
-  module EnvHijack
-    attr_reader :__callstack_logs
-
-    def self.extended obj
-      obj.instance_variable_set(:@__callstack_logs, [])
-      (obj.class.instance_methods(false) - instance_methods - [:inspect, :caller]).reject { |m| m.to_s =~ /^__/ }.each do |m|
-        obj.singleton_class.instance_exec(m) { |m| alias_method "__#{m}_without_logging", m }
-        obj.define_singleton_method(m) do |*a, &b|
-          __log_method_call m, *a, &b
-          super *a, &b
+  class Timeout
+    module EnvHijack
+      Hash.instance_methods.each do |m|
+        define_method(m.to_s.sub(/(?=[!?]?$)/, "_without_hijack")) { |*a,&b| Hash.instance_method(m).bind(self).call *a,&b }
+        define_method m do |*a,&b|
+          has_rt_info_before = member_without_hijack? "rack-timeout.info" #Rack::Timeout::ENV_INFO_KEY
+          result = super *a,&b
+          has_rt_info_after = member_without_hijack? "rack-timeout.info"  #Rack::Timeout::ENV_INFO_KEY
+          if has_rt_info_before && !has_rt_info_after
+            caller.each_with_index do |line, ix|
+              warn "source=rack-timeout-debug id=#{req_id} ix=#{ix} call=#{line}\n"
+            end
+          end
+          return result
         end
+      end
+
+      def req_id
+        @req_id ||= self["HTTP_X_REQUEST_ID"] || SecureRandom.hex
       end
     end
 
-    def __log_method_call m, *a, &b
-      @__callstack_logs << [m, a, b, caller(2), __size_without_logging, Time.now, Thread.current.object_id]
-    end
-  end
-
-  class Timeout
     include Rack::Timeout::MonotonicTime # gets us the #fsecs method
 
     module ExceptionWithEnv # shared by the following exceptions, allows them to receive the current env
@@ -96,9 +97,10 @@ module Rack
     def call(env)
       info      = (env[ENV_INFO_KEY] ||= RequestDetails.new)
       info.id ||= env["HTTP_X_REQUEST_ID"] || SecureRandom.hex
-      @info = info
-      @env_id = env.object_id
-      env.extend EnvHijack
+
+      class << env
+        prepend EnvHijack unless ancestors.include? EnvHijack
+      end
 
       time_started_service = Time.now                      # The wall time the request started being processed by rack
       ts_started_service   = fsecs                         # The monotonic time the request started being processed by rack
@@ -114,7 +116,7 @@ module Rack
         seconds_service_left    = final_wait_timeout - seconds_waited      # first calculation of service timeout (relevant if request doesn't get expired, may be overriden later)
         info.wait, info.timeout = seconds_waited, final_wait_timeout       # updating the info properties; info.timeout will be the wait timeout at this point
         if seconds_service_left <= 0 # expire requests that have waited for too long in the queue (as they are assumed to have been dropped by the web server / routing layer at this point)
-          _set_state! env, :expired
+          RT._set_state! env, :expired
           raise RequestExpiryError.new(env), "Request older than #{info.ms(:timeout)}."
         end
       end
@@ -126,13 +128,13 @@ module Rack
       info.timeout = service_timeout # nice and simple, when service_past_wait is true, not so much otherwise:
       info.timeout = seconds_service_left if !service_past_wait && seconds_service_left && seconds_service_left > 0 && seconds_service_left < service_timeout
 
-      _set_state! env, :ready                            # we're good to go, but have done nothing yet
+      RT._set_state! env, :ready                            # we're good to go, but have done nothing yet
 
       heartbeat_event = nil                                 # init var so it's in scope for following proc
       register_state_change = ->(status = :active) {        # updates service time and state; will run every second
         heartbeat_event.cancel! if status != :active        # if the request is no longer active we should stop updating every second
         info.service = fsecs - ts_started_service           # update service time
-        _set_state! env, status                             # update status
+        RT._set_state! env, status                          # update status
       }
       heartbeat_event = RT::Scheduler.run_every(1) { register_state_change.call :active }  # start updating every second while active; if log level is debug, this will log every sec
 
@@ -184,32 +186,13 @@ module Rack
       true
     end
 
-    def _set_state!(env, state)
+    def self._set_state!(env, state)
       raise "Invalid state: #{state.inspect}" unless VALID_STATES.include? state
       info = env[ENV_INFO_KEY]
       if info.nil?
-        at = caller.grep(/\/core.rb:/).map { |s| s[/:(\d+):in `/, 1] }.join(",")
-        size = env.__size_without_logging
-        key = env.__keys_without_logging.first if size == 1
-        warn "source=rack-timeout-debug info-present=#{!info.nil?} env-keys-count=#{size}#{" key=#{key}" if key} req-id=#{@info.id} thread=#{Thread.current.object_id} time=#{Time.now.utc.strftime('%T.%L')} at=#{at}\n"
-        pre = "source=rack-timeout-debug req-id=#{@info.id}"
-        stacklog = env.__callstack_logs.each_with_index do |(m,a,b,stack,size,t,thr),ix|
-          next if %i{ [] default fetch }.include? m
-          ixs = ix.to_s.rjust(3, '0')
-          args = a.map{|a|
-            case a
-            when Symbol, String, Numeric, NilClass, true, false; a.inspect
-            when Array; "[#{a.size}]"
-            when Hash; "{#{a.size}}"
-            else "<#{a.class.name}>"
-            end
-          }.join(',')
-          warn "#{pre} stack=#{ixs}---- thread=#{thr} time=#{t.strftime('%T.%L')} size=#{size} call=#{m}(#{args})#{'{}' if b}\n"
-          stack.each_with_index { |l,ix1| warn "#{pre} stack=#{ixs}-#{ix1.to_s.rjust(3, '0')} #{l}" }
-        end
+        warn "source=rack-timeout-debug info-vanish id=#{env.req_id}\n"
         return
       end
-
       info.state = state
       RT.notify_state_change_observers(env)
     end
